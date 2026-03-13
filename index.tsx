@@ -9,6 +9,13 @@ import {
   signOut, 
   onAuthStateChanged, 
   sendEmailVerification, 
+  sendSignInLinkToEmail,
+  isSignInWithEmailLink,
+  signInWithEmailLink,
+  RecaptchaVerifier,
+  signInWithPhoneNumber,
+  ConfirmationResult,
+  signInAnonymously,
   User as FirebaseUser 
 } from 'firebase/auth';
 import { 
@@ -20,6 +27,7 @@ import {
   deleteDoc, 
   setDoc, 
   getDoc, 
+  getDocs,
   query, 
   where, 
   onSnapshot 
@@ -105,6 +113,7 @@ declare global {
   interface Window {
     google: any;
     aistudio?: AIStudio;
+    recaptchaVerifier?: any;
   }
 }
 
@@ -173,6 +182,238 @@ interface EmailTemplate {
   subject: string;
   body: string;
 }
+
+interface JobOpening {
+  id: string;
+  userId: string; // Recruiter ID
+  title: string;
+  location: string;
+  type: 'Full-time' | 'Part-time' | 'Contract' | 'Internship';
+  description: string;
+  requirements: string; // To be used for AI parsing context
+  generalInfo?: string;
+  status: 'Open' | 'Closed';
+  createdAt: number;
+}
+
+// --- Helper Functions ---
+
+// Standalone AI Call wrapper for external components
+async function standaloneSafeAiCall<T>(fn: () => Promise<T>, apiKey: string): Promise<T> {
+  try {
+    return await fn();
+  } catch (error: any) {
+    if (error?.message?.includes('Requested entity was not found') && window.aistudio) {
+        await window.aistudio.openSelectKey();
+        // We can't easily retry here without recursion and state, so we throw to let the caller handle UI
+    }
+    throw error;
+  }
+}
+
+async function processResumeUpload(
+  file: File,
+  targetUserId: string,
+  uploaderId: string,
+  jobId: string | null,
+  jd: { title: string, requirements: string },
+  apiKey: string,
+  storageInstance: any,
+  dbInstance: any,
+  onProgress: (msg: string) => void
+): Promise<any> {
+    // 1. Convert to Base64
+    const fileToBase64 = (f: File): Promise<string> => new Promise((resolve, reject) => {
+        const reader = new FileReader(); reader.readAsDataURL(f);
+        reader.onload = () => resolve((reader.result as string).split(',')[1]);
+        reader.onerror = reject;
+    });
+
+    onProgress(`Decoding ${file.name}...`);
+    const base64 = await fileToBase64(file);
+    const isImage = file.type.startsWith('image/');
+
+    // 2. Upload to Firebase Storage
+    // Use uploaderId (the current anonymous user) for the path to ensure they have write permission
+    // to their own folder (standard Firebase Rule: allow write: if request.auth.uid == userId)
+    const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const storagePath = `resumes/${uploaderId}/${Date.now()}_${safeName}`;
+    const storageRef = ref(storageInstance, storagePath);
+    
+    onProgress(`Uploading to secure storage...`);
+    try {
+        await uploadBytes(storageRef, file);
+    } catch (error: any) {
+        console.error("Storage Upload Error (User Path):", error);
+        
+        // Fallback: Try public path if user-specific path fails
+        // This might work if rules are open for public but restricted for user paths (unlikely but possible)
+        // or if the user has specific public folder rules.
+        try {
+            console.log("Attempting fallback to public_uploads...");
+            const publicPath = `public_uploads/${Date.now()}_${safeName}`;
+            const publicRef = ref(storageInstance, publicPath);
+            await uploadBytes(publicRef, file);
+            // If successful, update storageRef to point to publicRef for getDownloadURL
+            // We can't reassign const storageRef, so we just get URL from publicRef
+            const publicUrl = await getDownloadURL(publicRef);
+            
+            // Continue with publicUrl
+            // We need to return here or restructure to avoid the original error throwing
+            
+            // 3. AI Analysis (Copied from below to avoid refactoring entire function structure deeply)
+            onProgress(`Neural analysis in progress...`);
+            const response = await standaloneSafeAiCall(async () => {
+                const ai = new GoogleGenAI({ apiKey });
+                return await ai.models.generateContent({
+                model: 'gemini-3-flash-preview',
+                contents: {
+                    parts: [
+                    { inlineData: { mimeType: file.type || 'application/pdf', data: base64 } },
+                    { text: `SYSTEM DIRECTIVE: Detailed analysis of this candidate's profile/resume against the Job Description:
+                    - Title: ${jd.title}
+                    - Requirements: ${jd.requirements}
+                    
+                    Identify technical skills, core experience, and educational background. Assign a score (0-100) based on role suitability.
+                    Output ONLY valid JSON matching this schema:
+                    {
+                        "name": "Full Name",
+                        "email": "Email address",
+                        "phone": "Phone number",
+                        "skills": ["Skill 1", "Skill 2"],
+                        "experience": "Brief summary of experience",
+                        "education": "Degree details",
+                        "score": number,
+                        "reasoning": "Technical justification for the score",
+                        "aiTags": ["Tag 1", "Tag 2"]
+                    }` }
+                    ],
+                },
+                config: {
+                    responseMimeType: "application/json",
+                    responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                        name: { type: Type.STRING },
+                        email: { type: Type.STRING },
+                        phone: { type: Type.STRING },
+                        skills: { type: Type.ARRAY, items: { type: Type.STRING } },
+                        experience: { type: Type.STRING },
+                        education: { type: Type.STRING },
+                        score: { type: Type.NUMBER },
+                        reasoning: { type: Type.STRING },
+                        aiTags: { type: Type.ARRAY, items: { type: Type.STRING } }
+                    },
+                    required: ["name", "email", "phone", "skills", "experience", "education", "score", "reasoning", "aiTags"],
+                    }
+                }
+                });
+            }, apiKey);
+
+            const result = JSON.parse(response.text || '{}');
+
+            // 4. Save to Firestore
+            const newCandidate: any = {
+                ...result,
+                userId: targetUserId, // Assigned to the recruiter
+                jobId: jobId, // Link to specific job if applicable
+                status: result.score > 85 ? 'Selected' : result.score > 60 ? 'Pending' : 'Rejected',
+                timestamp: Date.now(),
+                history: [{ event: 'Neural Core Decoded (Public Upload - Fallback)', time: Date.now() }],
+                fileUrl: publicUrl,
+                fileStoragePath: publicPath,
+                fileMime: file.type || 'application/pdf',
+            };
+
+            if (isImage) {
+                newCandidate.portfolioImageUrl = publicUrl;
+            }
+
+            await addDoc(collection(dbInstance, 'candidates'), newCandidate);
+            return newCandidate;
+
+        } catch (fallbackError: any) {
+             console.error("Fallback Upload Error:", fallbackError);
+             if (error.code === 'storage/unauthorized') {
+                throw new Error("Storage Permission Denied. Please enable 'Anonymous' auth in Firebase Console OR update Storage Rules to allow writes to 'resumes/{userId}'.");
+            }
+            throw error;
+        }
+    }
+    const fileUrl = await getDownloadURL(storageRef);
+
+    // 3. AI Analysis
+    onProgress(`Neural analysis in progress...`);
+    const response = await standaloneSafeAiCall(async () => {
+        const ai = new GoogleGenAI({ apiKey });
+        return await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: {
+            parts: [
+            { inlineData: { mimeType: file.type || 'application/pdf', data: base64 } },
+            { text: `SYSTEM DIRECTIVE: Detailed analysis of this candidate's profile/resume against the Job Description:
+            - Title: ${jd.title}
+            - Requirements: ${jd.requirements}
+            
+            Identify technical skills, core experience, and educational background. Assign a score (0-100) based on role suitability.
+            Output ONLY valid JSON matching this schema:
+            {
+                "name": "Full Name",
+                "email": "Email address",
+                "phone": "Phone number",
+                "skills": ["Skill 1", "Skill 2"],
+                "experience": "Brief summary of experience",
+                "education": "Degree details",
+                "score": number,
+                "reasoning": "Technical justification for the score",
+                "aiTags": ["Tag 1", "Tag 2"]
+            }` }
+            ],
+        },
+        config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+                name: { type: Type.STRING },
+                email: { type: Type.STRING },
+                phone: { type: Type.STRING },
+                skills: { type: Type.ARRAY, items: { type: Type.STRING } },
+                experience: { type: Type.STRING },
+                education: { type: Type.STRING },
+                score: { type: Type.NUMBER },
+                reasoning: { type: Type.STRING },
+                aiTags: { type: Type.ARRAY, items: { type: Type.STRING } }
+            },
+            required: ["name", "email", "phone", "skills", "experience", "education", "score", "reasoning", "aiTags"],
+            }
+        }
+        });
+    }, apiKey);
+
+    const result = JSON.parse(response.text || '{}');
+
+    // 4. Save to Firestore
+    const newCandidate: any = {
+        ...result,
+        userId: targetUserId, // Assigned to the recruiter
+        jobId: jobId, // Link to specific job if applicable
+        status: result.score > 85 ? 'Selected' : result.score > 60 ? 'Pending' : 'Rejected',
+        timestamp: Date.now(),
+        history: [{ event: 'Neural Core Decoded (Public Upload)', time: Date.now() }],
+        fileUrl: fileUrl,
+        fileStoragePath: storagePath,
+        fileMime: file.type || 'application/pdf',
+    };
+
+    if (isImage) {
+        newCandidate.portfolioImageUrl = fileUrl;
+    }
+
+    await addDoc(collection(dbInstance, 'candidates'), newCandidate);
+    return newCandidate;
+}
+
 
 // --- Constants ---
 const DEFAULT_TEMPLATES: EmailTemplate[] = [
@@ -422,6 +663,296 @@ const HighEndBackground: React.FC = () => {
   );
 };
 
+// --- Job Components ---
+
+const JobOpeningsManager: React.FC<{ user: FirebaseUser }> = ({ user }) => {
+  const [jobs, setJobs] = useState<JobOpening[]>([]);
+  const [isEditing, setIsEditing] = useState(false);
+  const [currentJob, setCurrentJob] = useState<Partial<JobOpening>>({});
+  const [notification, setNotification] = useState<string | null>(null);
+
+  useEffect(() => {
+    const q = query(collection(db, 'jobOpenings'), where('userId', '==', user.uid));
+    const unsub = onSnapshot(q, (snap) => {
+      setJobs(snap.docs.map(d => ({ ...d.data(), id: d.id } as JobOpening)));
+    }, (error) => {
+      console.error("JobOpenings listener error:", error);
+      setNotification("Error syncing jobs: Permission denied.");
+    });
+    return () => unsub();
+  }, [user]);
+
+  const handleSave = async () => {
+    if (!currentJob.title || !currentJob.description) return;
+    try {
+      if (currentJob.id) {
+        await updateDoc(doc(db, 'jobOpenings', currentJob.id), currentJob);
+        setNotification("Job Updated");
+      } else {
+        await addDoc(collection(db, 'jobOpenings'), {
+          ...currentJob,
+          userId: user.uid,
+          createdAt: Date.now(),
+          status: 'Open'
+        });
+        setNotification("Job Created");
+      }
+      setIsEditing(false);
+      setCurrentJob({});
+    } catch (e) {
+      console.error(e);
+      setNotification("Error saving job");
+    }
+    setTimeout(() => setNotification(null), 3000);
+  };
+
+  const handleDelete = async (id: string) => {
+    if (confirm("Delete this job opening?")) {
+      await deleteDoc(doc(db, 'jobOpenings', id));
+    }
+  };
+
+  return (
+    <div className="space-y-10">
+      {notification && <div className="fixed top-4 right-4 bg-accent text-black px-4 py-2 rounded-lg z-50 font-bold">{notification}</div>}
+      
+      <div className="bg-white/5 rounded-[2.5rem] border border-white/5 p-10 backdrop-blur-md">
+        <div className="flex justify-between items-center mb-8">
+          <h2 className="text-3xl font-black text-white uppercase tracking-tighter">Job Openings</h2>
+          <button onClick={() => { setCurrentJob({ status: 'Open', type: 'Full-time' }); setIsEditing(true); }} className="px-6 py-3 bg-white text-black rounded-full font-black text-xs uppercase tracking-widest hover:scale-105 transition-transform">
+            Create New Position
+          </button>
+        </div>
+
+        <div className="grid gap-6">
+          {jobs.map(job => (
+            <div key={job.id} className="p-6 bg-white/5 rounded-2xl border border-white/5 hover:border-white/20 transition-all group relative">
+               <div className="flex justify-between items-start">
+                 <div>
+                   <h3 className="text-xl font-black text-white">{job.title}</h3>
+                   <div className="flex gap-4 mt-2 text-xs font-mono text-white/50 uppercase">
+                     <span>{job.location}</span>
+                     <span>•</span>
+                     <span>{job.type}</span>
+                     <span>•</span>
+                     <span className={job.status === 'Open' ? 'text-emerald-400' : 'text-rose-400'}>{job.status}</span>
+                   </div>
+                 </div>
+                 <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                   <button onClick={() => { setCurrentJob(job); setIsEditing(true); }} className="p-2 bg-white/10 rounded-lg hover:bg-white hover:text-black transition-all"><Edit3 size={16} /></button>
+                   <button onClick={() => handleDelete(job.id)} className="p-2 bg-rose-500/10 text-rose-500 rounded-lg hover:bg-rose-500 hover:text-white transition-all"><Trash2 size={16} /></button>
+                 </div>
+               </div>
+            </div>
+          ))}
+          {jobs.length === 0 && <div className="text-center py-10 opacity-30 font-mono uppercase">No active job protocols.</div>}
+        </div>
+      </div>
+
+      {isEditing && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center p-6 bg-black/80 backdrop-blur-sm">
+          <div className="bg-[#0a0a0a] border border-white/10 rounded-[2rem] p-8 w-full max-w-2xl space-y-6 animate-in zoom-in-95">
+            <h3 className="text-xl font-black text-white uppercase">{currentJob.id ? 'Edit Protocol' : 'New Protocol'}</h3>
+            <div className="grid grid-cols-2 gap-4">
+              <input placeholder="Job Title" value={currentJob.title || ''} onChange={e => setCurrentJob({...currentJob, title: e.target.value})} className="col-span-2 bg-white/5 border border-white/10 rounded-xl p-4 text-white outline-none focus:border-accent" />
+              <input placeholder="Location" value={currentJob.location || ''} onChange={e => setCurrentJob({...currentJob, location: e.target.value})} className="bg-white/5 border border-white/10 rounded-xl p-4 text-white outline-none focus:border-accent" />
+              <select value={currentJob.type || 'Full-time'} onChange={e => setCurrentJob({...currentJob, type: e.target.value as any})} className="bg-white/5 border border-white/10 rounded-xl p-4 text-white outline-none focus:border-accent">
+                <option value="Full-time">Full-time</option>
+                <option value="Part-time">Part-time</option>
+                <option value="Contract">Contract</option>
+                <option value="Internship">Internship</option>
+              </select>
+              <select value={currentJob.status || 'Open'} onChange={e => setCurrentJob({...currentJob, status: e.target.value as any})} className="bg-white/5 border border-white/10 rounded-xl p-4 text-white outline-none focus:border-accent">
+                <option value="Open">Open</option>
+                <option value="Closed">Closed</option>
+              </select>
+            </div>
+            <textarea placeholder="Description & Requirements" rows={6} value={currentJob.description || ''} onChange={e => setCurrentJob({...currentJob, description: e.target.value, requirements: e.target.value})} className="w-full bg-white/5 border border-white/10 rounded-xl p-4 text-white outline-none focus:border-accent resize-none" />
+            <textarea placeholder="General Information / Additional Details" rows={4} value={currentJob.generalInfo || ''} onChange={e => setCurrentJob({...currentJob, generalInfo: e.target.value})} className="w-full bg-white/5 border border-white/10 rounded-xl p-4 text-white outline-none focus:border-accent resize-none" />
+            <div className="flex gap-4">
+              <button onClick={handleSave} className="flex-1 py-4 bg-accent text-black font-black rounded-xl uppercase tracking-widest text-xs">Save Protocol</button>
+              <button onClick={() => setIsEditing(false)} className="px-8 py-4 bg-white/5 text-white font-black rounded-xl uppercase tracking-widest text-xs hover:bg-white/10">Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const JobBoard: React.FC<{ onApply: (job: JobOpening) => void }> = ({ onApply }) => {
+  const [jobs, setJobs] = useState<JobOpening[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  
+  useEffect(() => {
+    const fetchJobs = async () => {
+        try {
+            const q = query(collection(db, 'jobOpenings'), where('status', '==', 'Open'));
+            const snap = await getDocs(q);
+            setJobs(snap.docs.map(d => ({ ...d.data(), id: d.id } as JobOpening)));
+            setError(null);
+        } catch (err: any) {
+            console.warn("JobBoard Error:", err);
+            if (err.code === 'permission-denied') {
+                setError("Public access restricted. Please enable Anonymous Auth in Firebase Console.");
+            } else {
+                setError("Unable to load job openings.");
+            }
+        }
+    };
+    fetchJobs();
+  }, []);
+
+  return (
+    <div className="py-20 px-[10%] relative z-10">
+      <h2 className="text-4xl font-black text-white mb-12 uppercase tracking-tighter">Open Positions</h2>
+      {error && <div className="p-4 bg-rose-500/10 border border-rose-500/20 text-rose-400 rounded-xl mb-8 font-mono text-xs">{error}</div>}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+        {jobs.map(job => (
+          <div key={job.id} className="bg-white/5 border border-white/10 p-8 rounded-[2rem] hover:border-accent/50 transition-all group flex flex-col h-full backdrop-blur-sm">
+            <div className="mb-6">
+              <h3 className="text-2xl font-bold text-white mb-2 group-hover:text-accent transition-colors">{job.title}</h3>
+              <p className="text-xs font-mono text-white/50 uppercase tracking-widest">{job.location} • {job.type}</p>
+            </div>
+            <p className="text-white/70 mb-8 line-clamp-3 flex-1 text-sm leading-relaxed">{job.description}</p>
+            <button onClick={() => onApply(job)} className="w-full py-4 bg-white text-black font-black rounded-xl uppercase tracking-widest text-xs hover:bg-accent transition-colors">
+              Initialize Application
+            </button>
+          </div>
+        ))}
+        {jobs.length === 0 && <div className="col-span-full text-center text-white/30 font-mono uppercase py-20">No active recruitment protocols.</div>}
+      </div>
+    </div>
+  );
+};
+
+const JobseekerPage: React.FC<{ initialJob: JobOpening | null, onBack: () => void }> = ({ initialJob, onBack }) => {
+  const [file, setFile] = useState<File | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [status, setStatus] = useState('');
+  const [uploadComplete, setUploadComplete] = useState(false);
+
+  const handleUpload = async () => {
+    if (!file || !initialJob) return;
+    
+    // Check API Key
+    if (window.aistudio) {
+        try {
+            if (!(await window.aistudio.hasSelectedApiKey())) {
+                await window.aistudio.openSelectKey();
+            }
+        } catch (e) { console.warn(e); }
+    }
+
+    let uploaderId = auth.currentUser?.uid;
+
+    // Try Anonymous Auth if not logged in
+    if (!uploaderId) {
+        try {
+            const userCredential = await signInAnonymously(auth);
+            uploaderId = userCredential.user.uid;
+        } catch (e: any) {
+            console.warn("Anonymous Auth failed (likely disabled in Console):", e);
+            // If anonymous auth fails, we fall back to 'public' but warn the user
+            // that this will likely fail unless storage rules are very open.
+            uploaderId = 'public';
+        }
+    }
+
+    setIsUploading(true);
+    try {
+      await processResumeUpload(
+        file,
+        initialJob.userId, // Target Recruiter
+        uploaderId || 'public', // Uploader ID (for storage path)
+        initialJob.id,
+        { title: initialJob.title, requirements: initialJob.requirements || initialJob.description },
+        process.env.API_KEY || '',
+        storage,
+        db,
+        (msg) => setStatus(msg)
+      );
+      setUploadComplete(true);
+      setStatus("Application Protocol Complete.");
+    } catch (e: any) {
+      console.error(e);
+      setStatus(`Error: ${e.message}`);
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  if (uploadComplete) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-black text-white relative overflow-hidden">
+        <div className="scanline"></div>
+        <div className="text-center space-y-6 z-10 p-10 bg-white/5 border border-white/10 rounded-[3rem] backdrop-blur-xl animate-in zoom-in-95">
+          <CheckCircle size={64} className="mx-auto text-emerald-400" />
+          <h2 className="text-3xl font-black uppercase tracking-tight">Application Received</h2>
+          <p className="text-white/50 font-mono text-sm max-w-md">Your profile has been synthesized and routed to the neural core for evaluation.</p>
+          <button onClick={onBack} className="px-8 py-4 bg-white text-black font-black rounded-xl uppercase tracking-widest text-xs hover:bg-emerald-400 transition-colors">Return to Base</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-black text-white relative overflow-y-auto custom-scrollbar">
+      <div className="scanline"></div>
+      <div className="max-w-3xl mx-auto py-20 px-6 relative z-10">
+        <button onClick={onBack} className="mb-10 flex items-center gap-2 text-white/50 hover:text-white transition-colors font-mono text-xs uppercase tracking-widest">
+          <ArrowRight className="rotate-180" size={16} /> Return to Job Board
+        </button>
+        
+        <div className="bg-white/5 border border-white/10 rounded-[3rem] p-12 backdrop-blur-xl shadow-2xl">
+          <h1 className="text-4xl font-black mb-2 uppercase tracking-tighter">Apply for Position</h1>
+          <h2 className="text-xl text-accent font-bold mb-10">{initialJob?.title}</h2>
+          
+          <div className="space-y-6 mb-10">
+            {initialJob?.description && (
+              <div className="p-6 bg-white/5 rounded-2xl border border-white/5">
+                <h3 className="text-xs font-bold text-white/50 mb-2 uppercase tracking-widest">Description</h3>
+                <p className="text-white/80 text-sm leading-relaxed whitespace-pre-wrap">{initialJob.description}</p>
+              </div>
+            )}
+            {initialJob?.generalInfo && (
+              <div className="p-6 bg-white/5 rounded-2xl border border-white/5">
+                <h3 className="text-xs font-bold text-white/50 mb-2 uppercase tracking-widest">General Information</h3>
+                <p className="text-white/80 text-sm leading-relaxed whitespace-pre-wrap">{initialJob.generalInfo}</p>
+              </div>
+            )}
+          </div>
+          
+          <div className="space-y-8">
+            <div className="p-8 border border-dashed border-white/20 rounded-2xl bg-black/20 text-center hover:border-accent/50 transition-colors group">
+              <input type="file" onChange={e => setFile(e.target.files?.[0] || null)} className="hidden" id="resume-upload" accept=".pdf,.doc,.docx,image/*" />
+              <label htmlFor="resume-upload" className="cursor-pointer block">
+                <Upload size={48} className="mx-auto mb-4 text-white/30 group-hover:text-accent transition-colors" />
+                <p className="font-bold text-lg mb-2">{file ? file.name : "Upload Resume / CV"}</p>
+                <p className="text-xs font-mono text-white/50 uppercase">PDF, DOCX, or Image (Max 15MB)</p>
+              </label>
+            </div>
+
+            {status && (
+                <div className={`p-4 bg-white/5 rounded-xl border border-white/5 font-mono text-xs ${status.startsWith('Error') ? 'text-rose-500 border-rose-500/20' : 'text-accent'} animate-pulse`}>
+                    {status}
+                </div>
+            )}
+
+            <button 
+              onClick={handleUpload} 
+              disabled={!file || isUploading}
+              className="w-full py-6 bg-white text-black font-black rounded-2xl uppercase tracking-[0.2em] text-sm hover:bg-accent transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-xl shadow-white/5"
+            >
+              {isUploading ? 'Synthesizing...' : 'Submit Application'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // --- Main App Component ---
 const App: React.FC = () => {
   const [user, setUser] = useState<FirebaseUser | null>(null);
@@ -432,6 +963,15 @@ const App: React.FC = () => {
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState('');
   const [isLoginMode, setIsLoginMode] = useState(true);
+  const [isPasswordlessMode, setIsPasswordlessMode] = useState(false);
+  const [isPhoneMode, setIsPhoneMode] = useState(false);
+  const [phoneNumber, setPhoneNumber] = useState('');
+  const [otp, setOtp] = useState('');
+  const [confirmationResult, setConfirmationResult] = useState<ConfirmationResult | null>(null);
+  const [recaptchaVerifier, setRecaptchaVerifier] = useState<RecaptchaVerifier | null>(null);
+  const [emailLinkSent, setEmailLinkSent] = useState(false);
+  const [showJobseeker, setShowJobseeker] = useState(false);
+  const [applyingJob, setApplyingJob] = useState<JobOpening | null>(null);
 
   const [cursorPos, setCursorPos] = useState({ x: 0, y: 0 });
   const [isCursorActive, setIsCursorActive] = useState(false);
@@ -484,9 +1024,34 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    // Check if user is signing in with email link
+    if (isSignInWithEmailLink(auth, window.location.href)) {
+        let email = window.localStorage.getItem('emailForSignIn');
+        if (!email) {
+            email = window.prompt('Please provide your email for confirmation');
+        }
+        if (email) {
+            signInWithEmailLink(auth, email, window.location.href)
+                .then((result) => {
+                    window.localStorage.removeItem('emailForSignIn');
+                    // Auth state listener will handle the rest
+                    // Clear URL parameters to clean up
+                    window.history.replaceState({}, document.title, window.location.pathname);
+                })
+                .catch((error) => {
+                    console.error("Email Link Sign-In Error", error);
+                    setLoginError(error.message);
+                });
+        }
+    }
+
     const unsubscribe = onAuthStateChanged(auth, (currentUser: FirebaseUser | null) => {
       // Allow login regardless of verification status
       if (currentUser) {
+        if (currentUser.isAnonymous) {
+            // Anonymous user (Jobseeker) - Do not redirect to dashboard
+            return;
+        }
         setUser(currentUser);
         setIsLoggedIn(true);
         setShowLanding(false);
@@ -623,6 +1188,121 @@ const App: React.FC = () => {
       throw error;
     }
   }
+
+  // Reset reCAPTCHA when switching modes
+  useEffect(() => {
+    if (!isPhoneMode) {
+        if (window.recaptchaVerifier) {
+            try {
+                window.recaptchaVerifier.clear();
+            } catch (e) { console.warn(e); }
+            window.recaptchaVerifier = undefined;
+            setRecaptchaVerifier(null);
+        }
+    }
+  }, [isPhoneMode]);
+
+  const setupRecaptcha = () => {
+    if (!window.recaptchaVerifier) {
+      // Ensure container is empty before rendering
+      const container = document.getElementById('recaptcha-container');
+      if (container) container.innerHTML = '';
+      
+      const verifier = new RecaptchaVerifier(auth, 'recaptcha-container', {
+        'size': 'invisible',
+        'callback': (response: any) => {
+          // reCAPTCHA solved
+        }
+      });
+      window.recaptchaVerifier = verifier;
+      setRecaptchaVerifier(verifier);
+    }
+  };
+
+  const handleSendOtp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginError('');
+    
+    // Basic E.164 validation
+    const phoneRegex = /^\+[1-9]\d{1,14}$/;
+    if (!phoneNumber || !phoneRegex.test(phoneNumber)) {
+        setLoginError("Invalid format. Use E.164 (e.g., +15555555555)");
+        return;
+    }
+    
+    try {
+        setupRecaptcha();
+        const appVerifier = window.recaptchaVerifier;
+        const confirmation = await signInWithPhoneNumber(auth, phoneNumber, appVerifier);
+        setConfirmationResult(confirmation);
+        setLoginError('');
+    } catch (error: any) {
+        console.error("SMS Error", error);
+        
+        // Reset reCAPTCHA on error so user can retry
+        if (window.recaptchaVerifier) {
+            try {
+                window.recaptchaVerifier.clear();
+            } catch (e) {}
+            window.recaptchaVerifier = undefined;
+            setRecaptchaVerifier(null);
+        }
+
+        if (error.code === 'auth/invalid-phone-number') {
+            setLoginError("Invalid phone number format.");
+        } else if (error.code === 'auth/billing-not-enabled') {
+            setLoginError("SMS requires Billing enabled in Firebase Console.");
+        } else if (error.code === 'auth/quota-exceeded') {
+            setLoginError("SMS quota exceeded. Try again later.");
+        } else if (error.message.includes('reCAPTCHA')) {
+            setLoginError("Verification failed. Please refresh and try again.");
+        } else {
+            setLoginError(error.message);
+        }
+    }
+  };
+
+  const handleVerifyOtp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginError('');
+    if (!otp || !confirmationResult) return;
+
+    try {
+        await confirmationResult.confirm(otp);
+        // Auth state listener will handle redirection
+    } catch (error: any) {
+        console.error("OTP Error", error);
+        setLoginError("Invalid verification code.");
+    }
+  };
+
+  const handleSendLink = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginError('');
+    if (!username) {
+        setLoginError("Please enter your email address.");
+        return;
+    }
+    
+    const actionCodeSettings = {
+        url: window.location.href, // Redirect back to the same page
+        handleCodeInApp: true,
+    };
+
+    try {
+        await sendSignInLinkToEmail(auth, username, actionCodeSettings);
+        window.localStorage.setItem('emailForSignIn', username);
+        setEmailLinkSent(true);
+        setLoginError('');
+    } catch (error: any) {
+        console.error("Send Link Error", error);
+        if (error.code === 'auth/operation-not-allowed') {
+            setLoginError("Email Link sign-in is disabled in Firebase Console.");
+        } else {
+            setLoginError(error.message);
+        }
+    }
+  };
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -896,90 +1576,18 @@ const App: React.FC = () => {
       }
 
       try {
-        addNotification(`Decoding (${i + 1}/${fileList.length}): ${file.name}...`);
-        
-        // 1. Convert to Base64 for Gemini Analysis (Keep in memory for now)
-        const base64 = await fileToBase64(file);
-        const isImage = file.type.startsWith('image/');
-        
-        // 2. Upload to Firebase Storage
-        // Sanitize filename to avoid weird character issues
-        const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_');
-        const storagePath = `resumes/${user.uid}/${Date.now()}_${safeName}`;
-        const storageRef = ref(storage, storagePath);
-        await uploadBytes(storageRef, file);
-        const fileUrl = await getDownloadURL(storageRef);
-
-        // 3. AI Analysis
-        const response = await safeAiCall(async () => {
-          const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-          return await ai.models.generateContent({
-            model: 'gemini-3-flash-preview',
-            contents: {
-              parts: [
-                { inlineData: { mimeType: file.type || 'application/pdf', data: base64 } },
-                { text: `SYSTEM DIRECTIVE: Detailed analysis of this candidate's profile/resume against the Job Description:
-                - Title: ${jd.title}
-                - Requirements: ${jd.requirements}
-                
-                Identify technical skills, core experience, and educational background. Assign a score (0-100) based on role suitability.
-                If this is NOT a resume, still try to extract relevant contact info and note the file nature in reasoning.
-                Output ONLY valid JSON matching this schema:
-                {
-                  "name": "Full Name",
-                  "email": "Email address",
-                  "phone": "Phone number",
-                  "skills": ["Skill 1", "Skill 2"],
-                  "experience": "Brief summary of experience",
-                  "education": "Degree details",
-                  "score": number,
-                  "reasoning": "Technical justification for the score",
-                  "aiTags": ["Tag 1", "Tag 2"]
-                }` }
-              ],
-            },
-            config: {
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  email: { type: Type.STRING },
-                  phone: { type: Type.STRING },
-                  skills: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  experience: { type: Type.STRING },
-                  education: { type: Type.STRING },
-                  score: { type: Type.NUMBER },
-                  reasoning: { type: Type.STRING },
-                  aiTags: { type: Type.ARRAY, items: { type: Type.STRING } }
-                },
-                required: ["name", "email", "phone", "skills", "experience", "education", "score", "reasoning", "aiTags"],
-              }
-            }
-          });
-        });
-
-        const result = JSON.parse(response.text || '{}');
-        
-        // 4. Save to Firestore (Store URL, not base64)
-        const newCandidate: any = {
-          ...result,
-          userId: user.uid,
-          status: result.score > 85 ? 'Selected' : result.score > 60 ? 'Pending' : 'Rejected',
-          timestamp: Date.now(),
-          history: [{ event: 'Neural Core Decoded', time: Date.now() }],
-          fileUrl: fileUrl,
-          fileStoragePath: storagePath,
-          fileMime: file.type || 'application/pdf',
-        };
-        
-        // Conditional add to avoid undefined
-        if (isImage) {
-            newCandidate.portfolioImageUrl = fileUrl;
-        }
-
-        await addDoc(collection(db, 'candidates'), newCandidate);
-        addNotification(`Synthesis Success: ${newCandidate.name}`);
+        await processResumeUpload(
+            file,
+            user.uid,
+            user.uid, // Recruiter is the uploader
+            null, // Generic upload, no specific job ID
+            jd, // Use global JD state
+            process.env.API_KEY || '',
+            storage,
+            db,
+            (msg) => addNotification(msg)
+        );
+        addNotification(`Synthesis Success: ${file.name}`);
 
         // Add a small sequential delay to avoid hitting RPM (Requests Per Minute) limits
         if (fileList.length > 1) await new Promise(r => setTimeout(r, 2000));
@@ -1235,6 +1843,7 @@ const App: React.FC = () => {
 
   if (showLanding) {
     if (showDeveloperProfile) return <DeveloperProfile />;
+    if (showJobseeker) return <JobseekerPage initialJob={applyingJob} onBack={() => { setShowJobseeker(false); setApplyingJob(null); }} />;
     return (
       <div className="neural-container">
         <NeuralStyles />
@@ -1262,9 +1871,14 @@ const App: React.FC = () => {
             <button onClick={() => setShowLanding(false)} className="text-white font-mono text-xs uppercase tracking-widest opacity-50 hover:opacity-100 transition-opacity">Logic-Flow</button>
           </nav>
         </header>
-        <main className="relative z-10 h-screen flex flex-col justify-center px-[10%]">
+        <main className="relative z-10 min-h-screen flex flex-col justify-center px-[10%] pt-20">
           <h1 className="hero-title animate-in fade-in slide-in-from-bottom duration-1000"><span>Intelligent</span><span>Talent Pipeline.</span></h1>
-          <button onClick={() => setShowLanding(false)} className="btn-mercury w-fit" onMouseEnter={() => setIsCursorActive(true)} onMouseLeave={() => setIsCursorActive(false)}>Initialize Core</button>
+          <div className="flex gap-6 mb-20">
+             <button onClick={() => setShowLanding(false)} className="btn-mercury w-fit" onMouseEnter={() => setIsCursorActive(true)} onMouseLeave={() => setIsCursorActive(false)}>Initialize Core</button>
+             <button onClick={() => setShowJobseeker(true)} className="px-10 py-5 bg-white/5 text-white border border-white/20 font-mono text-xs uppercase tracking-widest hover:bg-white hover:text-black transition-all">Jobseeker Portal</button>
+          </div>
+          
+          <JobBoard onApply={(job) => { setApplyingJob(job); setShowJobseeker(true); }} />
         </main>
       </div>
     );
@@ -1278,15 +1892,62 @@ const App: React.FC = () => {
         
         <div className="login-glass p-12 w-full max-w-md z-50 bg-black/60 backdrop-blur-3xl border border-white/10 rounded-[3rem]">
           <h2 className="text-white text-3xl font-black text-center uppercase mb-8">Secure Linkage</h2>
-          <form onSubmit={handleLogin} className="space-y-6">
-            <input type="text" value={username} onChange={e => setUsername(e.target.value)} className="w-full bg-white/5 border border-white/10 rounded-2xl p-4 text-sm font-bold text-white outline-none focus:border-accent" placeholder="email@domain.com" />
-            <input type="password" value={password} onChange={e => setPassword(e.target.value)} className="w-full bg-white/5 border border-white/10 rounded-2xl p-4 text-sm font-bold text-white outline-none focus:border-accent" placeholder="Access Key" />
-            {loginError && <p className="text-rose-500 text-xs text-center font-bold uppercase tracking-wide">{loginError}</p>}
-            <button className="btn-mercury w-full py-4 text-[0.7rem] tracking-[6px]">{isLoginMode ? 'Connect' : 'Register'}</button>
-          </form>
-          <button onClick={() => { setIsLoginMode(!isLoginMode); setLoginError(''); }} className="mt-8 w-full text-center font-mono text-[0.5rem] opacity-30 uppercase hover:opacity-100 transition-opacity">
-            {isLoginMode ? 'Need Access? Initialize Protocol (Sign Up)' : 'Return to Linkage (Login)'}
-          </button>
+          
+          {isPhoneMode ? (
+            confirmationResult ? (
+                <form onSubmit={handleVerifyOtp} className="space-y-6 animate-in fade-in">
+                    <input type="text" value={otp} onChange={e => setOtp(e.target.value)} className="w-full bg-white/5 border border-white/10 rounded-2xl p-4 text-sm font-bold text-white outline-none focus:border-accent text-center tracking-[1em]" placeholder="123456" maxLength={6} />
+                    {loginError && <p className="text-rose-500 text-xs text-center font-bold uppercase tracking-wide">{loginError}</p>}
+                    <button className="btn-mercury w-full py-4 text-[0.7rem] tracking-[6px]">Verify Code</button>
+                    <button type="button" onClick={() => setConfirmationResult(null)} className="w-full text-center text-xs text-white/50 hover:text-white mt-4">Change Number</button>
+                </form>
+            ) : (
+                <form onSubmit={handleSendOtp} className="space-y-6 animate-in fade-in">
+                    <input type="tel" value={phoneNumber} onChange={e => setPhoneNumber(e.target.value)} className="w-full bg-white/5 border border-white/10 rounded-2xl p-4 text-sm font-bold text-white outline-none focus:border-accent" placeholder="+1 555 555 5555" />
+                    <div id="recaptcha-container"></div>
+                    {loginError && <p className="text-rose-500 text-xs text-center font-bold uppercase tracking-wide">{loginError}</p>}
+                    <button className="btn-mercury w-full py-4 text-[0.7rem] tracking-[6px]">Send Code</button>
+                </form>
+            )
+          ) : isPasswordlessMode ? (
+            emailLinkSent ? (
+                <div className="text-center space-y-6 animate-in fade-in">
+                    <CheckCircle size={48} className="mx-auto text-emerald-400" />
+                    <p className="text-white font-bold">Link Sent!</p>
+                    <p className="text-white/50 text-sm">Check your email ({username}) for the secure sign-in link.</p>
+                    <button onClick={() => setEmailLinkSent(false)} className="text-xs text-accent hover:underline">Try again</button>
+                </div>
+            ) : (
+                <form onSubmit={handleSendLink} className="space-y-6 animate-in fade-in">
+                    <input type="email" value={username} onChange={e => setUsername(e.target.value)} className="w-full bg-white/5 border border-white/10 rounded-2xl p-4 text-sm font-bold text-white outline-none focus:border-accent" placeholder="email@domain.com" required />
+                    {loginError && <p className="text-rose-500 text-xs text-center font-bold uppercase tracking-wide">{loginError}</p>}
+                    <button className="btn-mercury w-full py-4 text-[0.7rem] tracking-[6px]">Send Magic Link</button>
+                </form>
+            )
+          ) : (
+            <form onSubmit={handleLogin} className="space-y-6 animate-in fade-in">
+                <input type="text" value={username} onChange={e => setUsername(e.target.value)} className="w-full bg-white/5 border border-white/10 rounded-2xl p-4 text-sm font-bold text-white outline-none focus:border-accent" placeholder="email@domain.com" />
+                <input type="password" value={password} onChange={e => setPassword(e.target.value)} className="w-full bg-white/5 border border-white/10 rounded-2xl p-4 text-sm font-bold text-white outline-none focus:border-accent" placeholder="Access Key" />
+                {loginError && <p className="text-rose-500 text-xs text-center font-bold uppercase tracking-wide">{loginError}</p>}
+                <button className="btn-mercury w-full py-4 text-[0.7rem] tracking-[6px]">{isLoginMode ? 'Connect' : 'Register'}</button>
+            </form>
+          )}
+
+          <div className="mt-8 space-y-4">
+            {!isPasswordlessMode && (
+                <button onClick={() => { setIsLoginMode(!isLoginMode); setLoginError(''); }} className="w-full text-center font-mono text-[0.5rem] opacity-30 uppercase hover:opacity-100 transition-opacity block">
+                    {isLoginMode ? 'Need Access? Initialize Protocol (Sign Up)' : 'Return to Linkage (Login)'}
+                </button>
+            )}
+            
+            <button onClick={() => { setIsPasswordlessMode(!isPasswordlessMode); setIsPhoneMode(false); setLoginError(''); setEmailLinkSent(false); }} className="w-full text-center font-mono text-[0.5rem] text-accent opacity-50 uppercase hover:opacity-100 transition-opacity block">
+                {isPasswordlessMode ? 'Use Password Access' : 'Use Passwordless Access (Magic Link)'}
+            </button>
+            
+            <button onClick={() => { setIsPhoneMode(!isPhoneMode); setIsPasswordlessMode(false); setLoginError(''); setConfirmationResult(null); }} className="w-full text-center font-mono text-[0.5rem] text-emerald-400 opacity-50 uppercase hover:opacity-100 transition-opacity block">
+                {isPhoneMode ? 'Use Email Access' : 'Use Mobile OTP Access'}
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -1304,6 +1965,7 @@ const App: React.FC = () => {
           <nav className="space-y-2">
             {[
               { id: 'dashboard', icon: LayoutDashboard, label: 'Dashboard' },
+              { id: 'jobs', icon: Briefcase, label: 'Job Openings' },
               { id: 'candidates', icon: Users, label: 'Talent Pool' },
               { id: 'emails', icon: Mail, label: 'Communication' },
               { id: 'settings', icon: Settings, label: 'Integrations' },
@@ -1371,6 +2033,8 @@ const App: React.FC = () => {
                  </div>
              </div>
           )}
+
+          {activeTab === 'jobs' && user && <JobOpeningsManager user={user} />}
 
           {activeTab === 'candidates' && (
             <div className="space-y-10">
