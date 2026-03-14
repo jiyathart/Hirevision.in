@@ -1,44 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI, Type, Modality } from "@google/genai";
-import { initializeApp } from 'firebase/app';
-import { 
-  getAuth, 
-  signInWithEmailAndPassword, 
-  createUserWithEmailAndPassword, 
-  signOut, 
-  onAuthStateChanged, 
-  sendEmailVerification, 
-  sendSignInLinkToEmail,
-  isSignInWithEmailLink,
-  signInWithEmailLink,
-  RecaptchaVerifier,
-  signInWithPhoneNumber,
-  ConfirmationResult,
-  signInAnonymously,
-  User as FirebaseUser 
-} from 'firebase/auth';
-import { 
-  getFirestore, 
-  collection, 
-  doc, 
-  addDoc, 
-  updateDoc, 
-  deleteDoc, 
-  setDoc, 
-  getDoc, 
-  getDocs,
-  query, 
-  where, 
-  onSnapshot 
-} from 'firebase/firestore';
-import { 
-  getStorage, 
-  ref, 
-  uploadBytes, 
-  getDownloadURL 
-} from 'firebase/storage';
-import { getAnalytics } from 'firebase/analytics';
+import { createClient } from '@supabase/supabase-js';
 import { 
   Upload, 
   Users, 
@@ -117,23 +80,22 @@ declare global {
   }
 }
 
-// --- Firebase Config ---
-const firebaseConfig = {
-  apiKey: "AIzaSyC8IlDVLmbtoqcs8Qn_jB37GxANjUz_Wuk",
-  authDomain: "hirevision-70315.firebaseapp.com",
-  projectId: "hirevision-70315",
-  storageBucket: "hirevision-70315.firebasestorage.app",
-  messagingSenderId: "410523114115",
-  appId: "1:410523114115:web:4776ba7c01300746ca19b6",
-  measurementId: "G-ND16BKQ80G"
+// --- Supabase Config ---
+import { supabase } from './src/supabaseClient.js';
+
+// Mock FirebaseUser type for compatibility
+type FirebaseUser = {
+  uid: string;
+  email: string | null;
+  phoneNumber: string | null;
+  isAnonymous: boolean;
 };
 
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
-const storage = getStorage(app);
-const analytics = getAnalytics(app);
+// Mock auth object for compatibility where needed
+const auth = {
+  currentUser: null as FirebaseUser | null
+};
+
 
 // --- Types ---
 type CandidateStatus = 'Pending' | 'Selected' | 'Waitlisted' | 'Rejected';
@@ -161,7 +123,6 @@ interface Candidate {
   portfolioImageUrl?: string; 
   portfolioAnalysis?: string;
   portfolioVideoUri?: string;
-  lastContacted?: number;
 }
 
 interface JobDescription {
@@ -193,7 +154,6 @@ interface JobOpening {
   requirements: string; // To be used for AI parsing context
   generalInfo?: string;
   status: 'Open' | 'Closed';
-  createdAt: number;
 }
 
 // --- Helper Functions ---
@@ -218,10 +178,13 @@ async function processResumeUpload(
   jobId: string | null,
   jd: { title: string, requirements: string },
   apiKey: string,
-  storageInstance: any,
-  dbInstance: any,
-  onProgress: (msg: string) => void
+  onProgress: (msg: string) => void,
+  manualData?: { name: string, email: string, phone: string }
 ): Promise<any> {
+    if (file.type !== 'application/pdf' && !file.type.startsWith('image/')) {
+        throw new Error(`Unsupported file type: ${file.name}. Only PDF and Images are supported by the AI engine.`);
+    }
+
     // 1. Convert to Base64
     const fileToBase64 = (f: File): Promise<string> => new Promise((resolve, reject) => {
         const reader = new FileReader(); reader.readAsDataURL(f);
@@ -238,109 +201,36 @@ async function processResumeUpload(
     // to their own folder (standard Firebase Rule: allow write: if request.auth.uid == userId)
     const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_');
     const storagePath = `resumes/${uploaderId}/${Date.now()}_${safeName}`;
-    const storageRef = ref(storageInstance, storagePath);
     
+    let finalFileUrl = "";
+    let finalStoragePath = "";
+    let storageUploadFailed = false;
+
     onProgress(`Uploading to secure storage...`);
     try {
-        await uploadBytes(storageRef, file);
+        const { error } = await supabase.storage.from('resumes').upload(storagePath, file);
+        if (error) throw error;
+        const { data: { publicUrl } } = supabase.storage.from('resumes').getPublicUrl(storagePath);
+        finalFileUrl = publicUrl;
+        finalStoragePath = storagePath;
     } catch (error: any) {
         console.error("Storage Upload Error (User Path):", error);
-        
-        // Fallback: Try public path if user-specific path fails
-        // This might work if rules are open for public but restricted for user paths (unlikely but possible)
-        // or if the user has specific public folder rules.
         try {
             console.log("Attempting fallback to public_uploads...");
             const publicPath = `public_uploads/${Date.now()}_${safeName}`;
-            const publicRef = ref(storageInstance, publicPath);
-            await uploadBytes(publicRef, file);
-            // If successful, update storageRef to point to publicRef for getDownloadURL
-            // We can't reassign const storageRef, so we just get URL from publicRef
-            const publicUrl = await getDownloadURL(publicRef);
-            
-            // Continue with publicUrl
-            // We need to return here or restructure to avoid the original error throwing
-            
-            // 3. AI Analysis (Copied from below to avoid refactoring entire function structure deeply)
-            onProgress(`Neural analysis in progress...`);
-            const response = await standaloneSafeAiCall(async () => {
-                const ai = new GoogleGenAI({ apiKey });
-                return await ai.models.generateContent({
-                model: 'gemini-3-flash-preview',
-                contents: {
-                    parts: [
-                    { inlineData: { mimeType: file.type || 'application/pdf', data: base64 } },
-                    { text: `SYSTEM DIRECTIVE: Detailed analysis of this candidate's profile/resume against the Job Description:
-                    - Title: ${jd.title}
-                    - Requirements: ${jd.requirements}
-                    
-                    Identify technical skills, core experience, and educational background. Assign a score (0-100) based on role suitability.
-                    Output ONLY valid JSON matching this schema:
-                    {
-                        "name": "Full Name",
-                        "email": "Email address",
-                        "phone": "Phone number",
-                        "skills": ["Skill 1", "Skill 2"],
-                        "experience": "Brief summary of experience",
-                        "education": "Degree details",
-                        "score": number,
-                        "reasoning": "Technical justification for the score",
-                        "aiTags": ["Tag 1", "Tag 2"]
-                    }` }
-                    ],
-                },
-                config: {
-                    responseMimeType: "application/json",
-                    responseSchema: {
-                    type: Type.OBJECT,
-                    properties: {
-                        name: { type: Type.STRING },
-                        email: { type: Type.STRING },
-                        phone: { type: Type.STRING },
-                        skills: { type: Type.ARRAY, items: { type: Type.STRING } },
-                        experience: { type: Type.STRING },
-                        education: { type: Type.STRING },
-                        score: { type: Type.NUMBER },
-                        reasoning: { type: Type.STRING },
-                        aiTags: { type: Type.ARRAY, items: { type: Type.STRING } }
-                    },
-                    required: ["name", "email", "phone", "skills", "experience", "education", "score", "reasoning", "aiTags"],
-                    }
-                }
-                });
-            }, apiKey);
-
-            const result = JSON.parse(response.text || '{}');
-
-            // 4. Save to Firestore
-            const newCandidate: any = {
-                ...result,
-                userId: targetUserId, // Assigned to the recruiter
-                jobId: jobId, // Link to specific job if applicable
-                status: result.score > 85 ? 'Selected' : result.score > 60 ? 'Pending' : 'Rejected',
-                timestamp: Date.now(),
-                history: [{ event: 'Neural Core Decoded (Public Upload - Fallback)', time: Date.now() }],
-                fileUrl: publicUrl,
-                fileStoragePath: publicPath,
-                fileMime: file.type || 'application/pdf',
-            };
-
-            if (isImage) {
-                newCandidate.portfolioImageUrl = publicUrl;
-            }
-
-            await addDoc(collection(dbInstance, 'candidates'), newCandidate);
-            return newCandidate;
-
+            const { error: fallbackError } = await supabase.storage.from('resumes').upload(publicPath, file);
+            if (fallbackError) throw fallbackError;
+            const { data: { publicUrl } } = supabase.storage.from('resumes').getPublicUrl(publicPath);
+            finalFileUrl = publicUrl;
+            finalStoragePath = publicPath;
         } catch (fallbackError: any) {
              console.error("Fallback Upload Error:", fallbackError);
-             if (error.code === 'storage/unauthorized') {
-                throw new Error("Storage Permission Denied. Please enable 'Anonymous' auth in Firebase Console OR update Storage Rules to allow writes to 'resumes/{userId}'.");
-            }
-            throw error;
+             console.error("\n❌ SUPABASE STORAGE RLS ERROR ❌\nTo fix this, go to your Supabase Dashboard -> Storage -> Policies.\n1. Create a bucket named 'resumes' and make it Public.\n2. Click 'New Policy' under the 'resumes' bucket.\n3. Choose 'For full customization'.\n4. Select 'INSERT' operation.\n5. Set 'WITH CHECK expression' to: true\n6. Save the policy.\n");
+             console.warn("Both storage uploads failed. Proceeding with AI analysis only (file will not be downloadable).");
+             storageUploadFailed = true;
+             // We don't throw an error here, we let the AI analysis proceed since we have the base64 data.
         }
     }
-    const fileUrl = await getDownloadURL(storageRef);
 
     // 3. AI Analysis
     onProgress(`Neural analysis in progress...`);
@@ -395,22 +285,31 @@ async function processResumeUpload(
 
     // 4. Save to Firestore
     const newCandidate: any = {
-        ...result,
+        name: manualData?.name || result.name || 'Unknown',
+        email: manualData?.email || result.email || '',
+        phone: manualData?.phone || result.phone || '',
+        skills: result.skills || [],
+        experience: result.experience || '',
+        education: result.education || '',
+        score: result.score || 0,
+        reasoning: result.reasoning || '',
+        aiTags: result.aiTags || [],
         userId: targetUserId, // Assigned to the recruiter
         jobId: jobId, // Link to specific job if applicable
-        status: result.score > 85 ? 'Selected' : result.score > 60 ? 'Pending' : 'Rejected',
+        status: (result.score || 0) > 85 ? 'Selected' : (result.score || 0) > 60 ? 'Pending' : 'Rejected',
         timestamp: Date.now(),
-        history: [{ event: 'Neural Core Decoded (Public Upload)', time: Date.now() }],
-        fileUrl: fileUrl,
-        fileStoragePath: storagePath,
+        history: [{ event: storageUploadFailed ? 'Neural Core Decoded (Storage Failed)' : 'Neural Core Decoded', time: Date.now() }],
+        fileUrl: finalFileUrl,
+        fileStoragePath: finalStoragePath,
         fileMime: file.type || 'application/pdf',
+        storageUploadFailed: storageUploadFailed
     };
 
-    if (isImage) {
-        newCandidate.portfolioImageUrl = fileUrl;
+    if (isImage && finalFileUrl) {
+        newCandidate.portfolioImageUrl = finalFileUrl;
     }
 
-    await addDoc(collection(dbInstance, 'candidates'), newCandidate);
+    const { data: insertedData, error: insertError } = await supabase.from('candidates').insert([newCandidate]).select().single(); if (insertError) throw insertError; newCandidate.id = insertedData.id;
     return newCandidate;
 }
 
@@ -672,29 +571,36 @@ const JobOpeningsManager: React.FC<{ user: FirebaseUser }> = ({ user }) => {
   const [notification, setNotification] = useState<string | null>(null);
 
   useEffect(() => {
-    const q = query(collection(db, 'jobOpenings'), where('userId', '==', user.uid));
-    const unsub = onSnapshot(q, (snap) => {
-      setJobs(snap.docs.map(d => ({ ...d.data(), id: d.id } as JobOpening)));
-    }, (error) => {
-      console.error("JobOpenings listener error:", error);
-      setNotification("Error syncing jobs: Permission denied.");
-    });
-    return () => unsub();
+    
+    const fetchJobs = async () => {
+      const { data, error } = await supabase.from('jobOpenings').select('*').eq('userId', user.uid);
+      if (error) {
+        console.error("JobOpenings fetch error:", error);
+        setNotification("Error syncing jobs: Permission denied.");
+      } else {
+        setJobs(data as JobOpening[]);
+      }
+    };
+    fetchJobs();
+    const channel = supabase.channel('jobOpenings_changes').on('postgres_changes', { event: '*', schema: 'public', table: 'jobOpenings', filter: `userId=eq.${user.uid}` }, payload => {
+      fetchJobs();
+    }).subscribe();
+    return () => { supabase.removeChannel(channel); };
+
   }, [user]);
 
   const handleSave = async () => {
     if (!currentJob.title || !currentJob.description) return;
     try {
       if (currentJob.id) {
-        await updateDoc(doc(db, 'jobOpenings', currentJob.id), currentJob);
+        const { error } = await supabase.from('jobOpenings').update(currentJob).eq('id', currentJob.id); if (error) throw error;
         setNotification("Job Updated");
       } else {
-        await addDoc(collection(db, 'jobOpenings'), {
+        const { error } = await supabase.from('jobOpenings').insert([{
           ...currentJob,
           userId: user.uid,
-          createdAt: Date.now(),
           status: 'Open'
-        });
+        }]); if (error) throw error;
         setNotification("Job Created");
       }
       setIsEditing(false);
@@ -708,7 +614,7 @@ const JobOpeningsManager: React.FC<{ user: FirebaseUser }> = ({ user }) => {
 
   const handleDelete = async (id: string) => {
     if (confirm("Delete this job opening?")) {
-      await deleteDoc(doc(db, 'jobOpenings', id));
+      const { error } = await supabase.from('jobOpenings').delete().eq('id', id); if (error) throw error;
     }
   };
 
@@ -787,9 +693,7 @@ const JobBoard: React.FC<{ onApply: (job: JobOpening) => void }> = ({ onApply })
   useEffect(() => {
     const fetchJobs = async () => {
         try {
-            const q = query(collection(db, 'jobOpenings'), where('status', '==', 'Open'));
-            const snap = await getDocs(q);
-            setJobs(snap.docs.map(d => ({ ...d.data(), id: d.id } as JobOpening)));
+            const { data, error } = await supabase.from('jobOpenings').select('*').eq('status', 'Open'); if (error) throw error; setJobs(data as JobOpening[]);
             setError(null);
         } catch (err: any) {
             console.warn("JobBoard Error:", err);
@@ -827,13 +731,19 @@ const JobBoard: React.FC<{ onApply: (job: JobOpening) => void }> = ({ onApply })
 };
 
 const JobseekerPage: React.FC<{ initialJob: JobOpening | null, onBack: () => void }> = ({ initialJob, onBack }) => {
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [phone, setPhone] = useState('');
   const [file, setFile] = useState<File | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [status, setStatus] = useState('');
   const [uploadComplete, setUploadComplete] = useState(false);
 
   const handleUpload = async () => {
-    if (!file || !initialJob) return;
+    if (!file || !initialJob || !name || !email) {
+      setStatus('Error: Name, Email, and Resume are required.');
+      return;
+    }
     
     // Check API Key
     if (window.aistudio) {
@@ -849,7 +759,7 @@ const JobseekerPage: React.FC<{ initialJob: JobOpening | null, onBack: () => voi
     // Try Anonymous Auth if not logged in
     if (!uploaderId) {
         try {
-            const userCredential = await signInAnonymously(auth);
+            const userCredential = await supabase.auth.signInAnonymously().then(res => { if (res.error) throw res.error; return { user: { uid: res.data.user.id, email: null, phoneNumber: null, isAnonymous: true } }; });
             uploaderId = userCredential.user.uid;
         } catch (e: any) {
             console.warn("Anonymous Auth failed (likely disabled in Console):", e);
@@ -868,9 +778,8 @@ const JobseekerPage: React.FC<{ initialJob: JobOpening | null, onBack: () => voi
         initialJob.id,
         { title: initialJob.title, requirements: initialJob.requirements || initialJob.description },
         process.env.API_KEY || '',
-        storage,
-        db,
-        (msg) => setStatus(msg)
+        (msg) => setStatus(msg),
+        { name, email, phone }
       );
       setUploadComplete(true);
       setStatus("Application Protocol Complete.");
@@ -924,12 +833,27 @@ const JobseekerPage: React.FC<{ initialJob: JobOpening | null, onBack: () => voi
           </div>
           
           <div className="space-y-8">
+            <div className="space-y-4">
+              <div>
+                <label className="block text-xs font-bold text-white/50 mb-2 uppercase tracking-widest">Full Name *</label>
+                <input type="text" value={name} onChange={e => setName(e.target.value)} className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-accent transition-colors" placeholder="Jane Doe" required />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-white/50 mb-2 uppercase tracking-widest">Email Address *</label>
+                <input type="email" value={email} onChange={e => setEmail(e.target.value)} className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-accent transition-colors" placeholder="jane@example.com" required />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-white/50 mb-2 uppercase tracking-widest">Phone Number</label>
+                <input type="tel" value={phone} onChange={e => setPhone(e.target.value)} className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-accent transition-colors" placeholder="+1 (555) 000-0000" />
+              </div>
+            </div>
+
             <div className="p-8 border border-dashed border-white/20 rounded-2xl bg-black/20 text-center hover:border-accent/50 transition-colors group">
-              <input type="file" onChange={e => setFile(e.target.files?.[0] || null)} className="hidden" id="resume-upload" accept=".pdf,.doc,.docx,image/*" />
+              <input type="file" onChange={e => setFile(e.target.files?.[0] || null)} className="hidden" id="resume-upload" accept=".pdf,image/*" />
               <label htmlFor="resume-upload" className="cursor-pointer block">
                 <Upload size={48} className="mx-auto mb-4 text-white/30 group-hover:text-accent transition-colors" />
-                <p className="font-bold text-lg mb-2">{file ? file.name : "Upload Resume / CV"}</p>
-                <p className="text-xs font-mono text-white/50 uppercase">PDF, DOCX, or Image (Max 15MB)</p>
+                <p className="font-bold text-lg mb-2">{file ? file.name : "Upload Resume / CV *"}</p>
+                <p className="text-xs font-mono text-white/50 uppercase">PDF or Image (Max 15MB)</p>
               </label>
             </div>
 
@@ -941,7 +865,7 @@ const JobseekerPage: React.FC<{ initialJob: JobOpening | null, onBack: () => voi
 
             <button 
               onClick={handleUpload} 
-              disabled={!file || isUploading}
+              disabled={!file || !name || !email || isUploading}
               className="w-full py-6 bg-white text-black font-black rounded-2xl uppercase tracking-[0.2em] text-sm hover:bg-accent transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-xl shadow-white/5"
             >
               {isUploading ? 'Synthesizing...' : 'Submit Application'}
@@ -1008,9 +932,6 @@ const App: React.FC = () => {
   const [isCandidateChatLoading, setIsCandidateChatLoading] = useState(false);
   const candidateChatEndRef = useRef<HTMLDivElement>(null);
 
-  const [isAnalyzingImage, setIsAnalyzingImage] = useState(false);
-  const [isGeneratingVideo, setIsGeneratingVideo] = useState(false);
-
   const [gmailClientId, setGmailClientId] = useState('');
   const [accessToken, setAccessToken] = useState<string>('');
 
@@ -1024,28 +945,10 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    // Check if user is signing in with email link
-    if (isSignInWithEmailLink(auth, window.location.href)) {
-        let email = window.localStorage.getItem('emailForSignIn');
-        if (!email) {
-            email = window.prompt('Please provide your email for confirmation');
-        }
-        if (email) {
-            signInWithEmailLink(auth, email, window.location.href)
-                .then((result) => {
-                    window.localStorage.removeItem('emailForSignIn');
-                    // Auth state listener will handle the rest
-                    // Clear URL parameters to clean up
-                    window.history.replaceState({}, document.title, window.location.pathname);
-                })
-                .catch((error) => {
-                    console.error("Email Link Sign-In Error", error);
-                    setLoginError(error.message);
-                });
-        }
-    }
+    supabase.auth.onAuthStateChange((_event, session) => {
+      const currentUser = session?.user ? { uid: session.user.id, email: session.user.email || null, phoneNumber: session.user.phone || null, isAnonymous: session.user.is_anonymous } : null;
+      auth.currentUser = currentUser;
 
-    const unsubscribe = onAuthStateChanged(auth, (currentUser: FirebaseUser | null) => {
       // Allow login regardless of verification status
       if (currentUser) {
         if (currentUser.isAnonymous) {
@@ -1061,16 +964,44 @@ const App: React.FC = () => {
         setCandidates([]);
         setTemplates([]);
       }
+    
     });
+    // Initial fetch
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      const currentUser = session?.user ? { uid: session.user.id, email: session.user.email || null, phoneNumber: session.user.phone || null, isAnonymous: session.user.is_anonymous } : null;
+      auth.currentUser = currentUser;
+
+      // Allow login regardless of verification status
+      if (currentUser) {
+        if (currentUser.isAnonymous) {
+            // Anonymous user (Jobseeker) - Do not redirect to dashboard
+            return;
+        }
+        setUser(currentUser);
+        setIsLoggedIn(true);
+        setShowLanding(false);
+      } else {
+        setUser(null);
+        setIsLoggedIn(false);
+        setCandidates([]);
+        setTemplates([]);
+      }
+    
+    });
+    const unsubscribe = () => {};
+
     return () => unsubscribe();
   }, []);
 
   // Ensure user profile exists on login
   useEffect(() => {
     if(user) {
-        const settingsRef = doc(db, 'users', user.uid);
-        // We use setDoc with merge to safely ensure existence without overwriting
-        setDoc(settingsRef, { email: user.email }, { merge: true }).catch((e: any) => console.log("Profile init error", e));
+        
+        // We use upsert to safely ensure existence without overwriting
+        supabase.from('users').upsert({ id: user.uid, email: user.email }).then(({ error }) => {
+            if (error) console.log("Profile init error", error);
+        });
+
     }
   }, [user]);
 
@@ -1079,43 +1010,59 @@ const App: React.FC = () => {
     if (!user) return;
 
     // Listen for Candidates
-    const candidatesQuery = query(collection(db, 'candidates'), where('userId', '==', user.uid));
-    const unsubCandidates = onSnapshot(candidatesQuery, (snapshot: any) => {
-      const loadedCandidates = snapshot.docs.map((doc: any) => ({ ...doc.data(), id: doc.id } as Candidate));
-      setCandidates(loadedCandidates);
-    }, (error: any) => {
-      console.warn("Candidates listener error (permission/network):", error);
-      addNotification("Sync compromised: Check permissions or network.");
-    });
+    
+    const fetchCandidates = async () => {
+      const { data, error } = await supabase.from('candidates').select('*').eq('userId', user.uid);
+      if (error) {
+        console.warn("Candidates listener error (permission/network):", error);
+        addNotification("Sync compromised: Check permissions or network.");
+      } else {
+        setCandidates(data as Candidate[]);
+      }
+    };
+    fetchCandidates();
+    const channelCandidates = supabase.channel('candidates_changes').on('postgres_changes', { event: '*', schema: 'public', table: 'candidates', filter: `userId=eq.${user.uid}` }, payload => {
+      fetchCandidates();
+    }).subscribe();
+
 
     // Listen for Templates
-    const templatesQuery = query(collection(db, 'templates'), where('userId', '==', user.uid));
-    const unsubTemplates = onSnapshot(templatesQuery, (snapshot: any) => {
-      const loadedTemplates = snapshot.docs.map((doc: any) => ({ ...doc.data(), id: doc.id } as EmailTemplate));
-      setTemplates(loadedTemplates.length > 0 ? loadedTemplates : DEFAULT_TEMPLATES);
-    }, (error: any) => {
-      console.warn("Templates listener error:", error);
-    });
+    
+    const fetchTemplates = async () => {
+      const { data, error } = await supabase.from('templates').select('*').eq('userId', user.uid);
+      if (error) {
+        console.warn("Templates listener error:", error);
+      } else {
+        setTemplates(data.length > 0 ? data as EmailTemplate[] : DEFAULT_TEMPLATES);
+      }
+    };
+    fetchTemplates();
+    const channelTemplates = supabase.channel('templates_changes').on('postgres_changes', { event: '*', schema: 'public', table: 'templates', filter: `userId=eq.${user.uid}` }, payload => {
+      fetchTemplates();
+    }).subscribe();
+
 
     // Listen for Settings (JD & Integration)
-    const settingsRef = doc(db, 'users', user.uid);
-    const unsubSettings = onSnapshot(settingsRef, (docSnap: any) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data();
+    
+    const fetchSettings = async () => {
+      const { data, error } = await supabase.from('users').select('*').eq('id', user.uid).single();
+      if (error) {
+        console.warn("Settings listener error:", error);
+      } else if (data) {
         if (data.jd) setJd(data.jd);
         if (data.gmailClientId) setGmailClientId(data.gmailClientId);
-      } else {
-        // Doc might not exist yet if the useEffect init hasn't completed.
-        // We do nothing here and let the explicit init handle creation.
       }
-    }, (error: any) => {
-      console.warn("Settings listener error:", error);
-    });
+    };
+    fetchSettings();
+    const channelSettings = supabase.channel('users_changes').on('postgres_changes', { event: '*', schema: 'public', table: 'users', filter: `id=eq.${user.uid}` }, payload => {
+      fetchSettings();
+    }).subscribe();
+
 
     return () => {
-      unsubCandidates();
-      unsubTemplates();
-      unsubSettings();
+      supabase.removeChannel(channelCandidates);
+      supabase.removeChannel(channelTemplates);
+      supabase.removeChannel(channelSettings);
     };
   }, [user]);
 
@@ -1310,11 +1257,11 @@ const App: React.FC = () => {
     try {
         if (isLoginMode) {
             // Sign In Logic
-            await signInWithEmailAndPassword(auth, username, password);
+            await supabase.auth.signInWithPassword({ email: username, password }).then(res => { if (res.error) throw res.error; return { user: { uid: res.data.user.id, email: res.data.user.email, phoneNumber: res.data.user.phone, isAnonymous: false } }; });
             // Auth state listener will handle redirection
         } else {
             // Sign Up Logic
-            const userCredential = await createUserWithEmailAndPassword(auth, username, password);
+            const userCredential = await supabase.auth.signUp({ email: username, password }).then(res => { if (res.error) throw res.error; return { user: { uid: res.data.user.id, email: res.data.user.email, phoneNumber: res.data.user.phone, isAnonymous: false } }; });
             // Optionally send verification email in background, but do not block
             // await sendEmailVerification(userCredential.user); 
             // Auth state listener will handle redirection
@@ -1331,7 +1278,7 @@ const App: React.FC = () => {
   };
 
   const handleLogout = async () => {
-    await signOut(auth);
+    await supabase.auth.signOut();
     setIsLoggedIn(false);
     setShowLanding(true);
   };
@@ -1408,7 +1355,9 @@ const App: React.FC = () => {
     }
     // Save client ID
     if (user) {
-      setDoc(doc(db, 'users', user.uid), { gmailClientId }, { merge: true });
+      supabase.from('users').upsert({ id: user.uid, gmailClientId }).then(({ error }) => {
+        if (error) console.error("Error saving gmailClientId:", error);
+      });
     }
 
     try {
@@ -1501,11 +1450,10 @@ const App: React.FC = () => {
                  await sendViaGmail(candidate.email, subject, personalizedBody);
                  
                  // Update History
-                 await updateDoc(doc(db, 'candidates', candidate.id), {
+                 const { error } = await supabase.from('candidates').update({
                     status: (draftData.targetStatus as CandidateStatus) || candidate.status,
-                    history: [...(candidate.history || []), { event: `Bulk Email: ${subject}`, time: Date.now() }],
-                    lastContacted: Date.now()
-                 });
+                    history: [...(candidate.history || []), { event: `Bulk Email: ${subject}`, time: Date.now() }]
+                 }).eq('id', candidate.id); if (error) throw error;
                  sentCount++;
                  // Rate limit protection
                  await new Promise(r => setTimeout(r, 500));
@@ -1526,14 +1474,13 @@ const App: React.FC = () => {
           }
 
           if (draftData.candidateId && draftData.targetStatus) {
-             const docRef = doc(db, 'candidates', draftData.candidateId);
+             
              const candidate = candidates.find(c => c.id === draftData.candidateId);
              if (candidate) {
-                await updateDoc(docRef, {
+                const { error } = await supabase.from('candidates').update({
                     status: draftData.targetStatus as CandidateStatus,
-                    history: [...(candidate.history || []), { event: `Sent: ${draftData.subject}`, time: Date.now() }],
-                    lastContacted: Date.now()
-                });
+                    history: [...(candidate.history || []), { event: `Sent: ${draftData.subject}`, time: Date.now() }]
+                }).eq('id', draftData.candidateId); if (error) throw error;
              }
           }
       }
@@ -1583,8 +1530,6 @@ const App: React.FC = () => {
             null, // Generic upload, no specific job ID
             jd, // Use global JD state
             process.env.API_KEY || '',
-            storage,
-            db,
             (msg) => addNotification(msg)
         );
         addNotification(`Synthesis Success: ${file.name}`);
@@ -1654,7 +1599,7 @@ const App: React.FC = () => {
       addNotification(`Updating ${count} candidates...`);
       try {
           await Promise.all(Array.from(selectedIds).map(id => 
-              updateDoc(doc(db, 'candidates', id), { status })
+              supabase.from('candidates').update({ status }).eq('id', id)
           ));
           addNotification(`Success: ${count} candidates updated to ${status}`);
           setSelectedIds(new Set());
@@ -1681,80 +1626,9 @@ const App: React.FC = () => {
     } catch (err) { addNotification("AI Interrogator Error"); } finally { setIsCandidateChatLoading(false); }
   };
 
-  const analyzePortfolio = async () => {
-    if (!selectedCandidate?.portfolioImageUrl) return;
-    setIsAnalyzingImage(true);
-    try {
-      // Note: Fetching image from storage URL for re-analysis requires CORS configuration on bucket.
-      // If fails, we catch error.
-      const resp = await fetch(selectedCandidate.portfolioImageUrl);
-      if (!resp.ok) throw new Error("Failed to fetch image");
-      const blob = await resp.blob();
-      const base64 = await new Promise<string>((resolve) => {
-          const reader = new FileReader();
-          reader.onloadend = () => resolve((reader.result as string).split(',')[1]);
-          reader.readAsDataURL(blob);
-      });
-
-      const response = await safeAiCall(async () => {
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        return await ai.models.generateContent({
-          model: 'gemini-3-pro-preview',
-          contents: { parts: [{ inlineData: { mimeType: 'image/jpeg', data: base64 } }, { text: "Evaluate this technical work. Provide a critique of innovation and logic." }] },
-          config: { thinkingConfig: { thinkingBudget: 15000 } }
-        });
-      });
-      const resText = response.text || "Critique synthesized.";
-      
-      await updateDoc(doc(db, 'candidates', selectedCandidate.id), { portfolioAnalysis: resText });
-      setSelectedCandidate(prev => prev ? { ...prev, portfolioAnalysis: resText } : null);
-
-    } catch (err: any) { 
-        addNotification("Critique failed. CORS or Quota limit."); 
-        console.error(err);
-    } finally { setIsAnalyzingImage(false); }
-  };
-
-  const generateVeoVideo = async () => {
-    if (!selectedCandidate?.portfolioImageUrl) return;
-    if (window.aistudio && !(await window.aistudio.hasSelectedApiKey())) {
-      await window.aistudio.openSelectKey();
-    }
-    setIsGeneratingVideo(true);
-    try {
-      // Fetch base64 for Veo
-      const resp = await fetch(selectedCandidate.portfolioImageUrl);
-      if (!resp.ok) throw new Error("Failed to fetch image");
-      const blob = await resp.blob();
-      const base64 = await new Promise<string>((resolve) => {
-          const reader = new FileReader();
-          reader.onloadend = () => resolve((reader.result as string).split(',')[1]);
-          reader.readAsDataURL(blob);
-      });
-
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      let op = await ai.models.generateVideos({
-        model: 'veo-3.1-fast-generate-preview',
-        image: { imageBytes: base64, mimeType: 'image/png' },
-        prompt: "A cinematic spotlight revealing details of this technical asset, slow and elegant.",
-        config: { resolution: '720p', aspectRatio: '16:9', numberOfVideos: 1 }
-      });
-      while (!op.done) {
-        await new Promise(r => setTimeout(r, 8000));
-        op = await ai.operations.getVideosOperation({ operation: op });
-      }
-      const uri = op.response?.generatedVideos?.[0]?.video?.uri;
-      if (uri) {
-        const url = `${uri}&key=${process.env.API_KEY}`;
-        await updateDoc(doc(db, 'candidates', selectedCandidate.id), { portfolioVideoUri: url });
-        setSelectedCandidate(prev => prev ? { ...prev, portfolioVideoUri: url } : null);
-      }
-    } catch (err) { addNotification("Veo Video Generation Failed (Check CORS/API)."); } finally { setIsGeneratingVideo(false); }
-  };
-
   const deleteTemplate = async (id: string) => {
     try {
-        await deleteDoc(doc(db, 'templates', id));
+        const { error } = await supabase.from('templates').delete().eq('id', id); if (error) throw error;
         addNotification("Protocol purged.");
     } catch (e) {
         addNotification("Delete failed.");
@@ -1765,20 +1639,20 @@ const App: React.FC = () => {
     if (!user) return;
     if (editingTemplate && editingTemplate.id && templates.some(t => t.id === editingTemplate.id)) {
       // Update
-      await updateDoc(doc(db, 'templates', editingTemplate.id), { 
+      const { error } = await supabase.from('templates').update({ 
           name: template.name, 
           subject: template.subject, 
           body: template.body 
-      });
+      }).eq('id', editingTemplate.id); if (error) throw error;
       addNotification("Protocol updated.");
     } else {
       // Add
-      await addDoc(collection(db, 'templates'), {
+      const { error } = await supabase.from('templates').insert([{
           userId: user.uid,
           name: template.name,
           subject: template.subject,
           body: template.body
-      });
+      }]); if (error) throw error;
       addNotification("New protocol saved.");
     }
     setIsTemplateEditorOpen(false);
@@ -1932,22 +1806,6 @@ const App: React.FC = () => {
                 <button className="btn-mercury w-full py-4 text-[0.7rem] tracking-[6px]">{isLoginMode ? 'Connect' : 'Register'}</button>
             </form>
           )}
-
-          <div className="mt-8 space-y-4">
-            {!isPasswordlessMode && (
-                <button onClick={() => { setIsLoginMode(!isLoginMode); setLoginError(''); }} className="w-full text-center font-mono text-[0.5rem] opacity-30 uppercase hover:opacity-100 transition-opacity block">
-                    {isLoginMode ? 'Need Access? Initialize Protocol (Sign Up)' : 'Return to Linkage (Login)'}
-                </button>
-            )}
-            
-            <button onClick={() => { setIsPasswordlessMode(!isPasswordlessMode); setIsPhoneMode(false); setLoginError(''); setEmailLinkSent(false); }} className="w-full text-center font-mono text-[0.5rem] text-accent opacity-50 uppercase hover:opacity-100 transition-opacity block">
-                {isPasswordlessMode ? 'Use Password Access' : 'Use Passwordless Access (Magic Link)'}
-            </button>
-            
-            <button onClick={() => { setIsPhoneMode(!isPhoneMode); setIsPasswordlessMode(false); setLoginError(''); setConfirmationResult(null); }} className="w-full text-center font-mono text-[0.5rem] text-emerald-400 opacity-50 uppercase hover:opacity-100 transition-opacity block">
-                {isPhoneMode ? 'Use Email Access' : 'Use Mobile OTP Access'}
-            </button>
-          </div>
         </div>
       </div>
     );
@@ -1992,7 +1850,7 @@ const App: React.FC = () => {
             </div>
             <label className={`flex items-center gap-3 px-6 py-3 bg-white text-black rounded-full text-xs font-black cursor-pointer shadow-xl transition-all hover:scale-105 active:scale-95 ${isUploading ? 'opacity-70' : ''}`}>
               <Upload size={16} /> {isUploading ? 'SYNTHESIZING...' : 'UPLOAD PROTOCOL'}
-              <input type="file" multiple hidden onChange={handleFileUpload} accept="*" />
+              <input type="file" multiple hidden onChange={handleFileUpload} accept=".pdf,image/*" />
             </label>
           </div>
         </header>
@@ -2151,7 +2009,6 @@ const App: React.FC = () => {
                               <div><p className="font-black text-white">{c.name}</p><p className="text-xs text-white/40 font-bold">{c.email}</p></div>
                             </div>
                             <div className="flex items-center gap-4">
-                              {c.lastContacted && <span className="text-[9px] font-mono opacity-30 uppercase">Synced: {new Date(c.lastContacted).toLocaleDateString()}</span>}
                               <button onClick={() => prepareDraftEmail(c, c.status)} className="p-4 bg-white/5 rounded-2xl hover:bg-white text-white hover:text-black transition-all"><Mail size={18} /></button>
                             </div>
                           </div>
@@ -2198,7 +2055,9 @@ const App: React.FC = () => {
                     <textarea rows={6} value={jd.requirements} onChange={e => setJd({...jd, requirements: e.target.value})} className="w-full bg-white/5 border border-white/10 rounded-2xl p-5 text-sm font-bold text-white outline-none focus:border-accent resize-none" placeholder="Core Requirements" />
                     <button onClick={() => { 
                         if (user) {
-                           setDoc(doc(db, 'users', user.uid), { jd }, { merge: true });
+                           supabase.from('users').upsert({ id: user.uid, jd }).then(({ error }) => {
+                               if (error) console.error("Error saving JD:", error);
+                           });
                            addNotification("Neural heuristics updated."); 
                         }
                     }} className="px-10 py-5 bg-white/10 text-white rounded-2xl font-black text-[10px] tracking-widest uppercase hover:bg-white hover:text-black transition-all">Commit Configuration</button>
@@ -2238,12 +2097,8 @@ const App: React.FC = () => {
                  <button onClick={() => setSelectedCandidate(null)} className="p-4 bg-white/5 rounded-full hover:bg-rose-500 hover:text-white transition-all"><X size={24} /></button>
               </div>
               <div className="flex-1 overflow-y-auto p-12 space-y-10 custom-scrollbar">
-                 <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                 <div className="grid grid-cols-1 gap-8">
                     <section className="bg-white/5 p-8 rounded-[2rem] border border-white/5"><h3 className="text-[10px] font-black text-accent uppercase tracking-[0.3em] mb-6">Neural Logic Reasoning</h3><p className="text-lg font-medium text-white/80 italic leading-relaxed">"{selectedCandidate.reasoning}"</p></section>
-                    <section className="bg-white/5 p-8 rounded-[2rem] border border-white/5 flex flex-col gap-4">
-                      <button onClick={analyzePortfolio} className="w-full py-5 bg-accent/10 text-accent font-black rounded-2xl border border-accent/20 hover:bg-accent hover:text-black transition-all text-xs tracking-widest uppercase">{isAnalyzingImage ? 'ANALYZING...' : 'PORTFOLIO CRITIQUE'}</button>
-                      <button onClick={generateVeoVideo} className="w-full py-5 bg-white/5 text-white font-black rounded-2xl border border-white/10 hover:bg-white hover:text-black transition-all text-xs tracking-widest uppercase">{isGeneratingVideo ? 'GENERATING...' : 'GENERATE HIGHLIGHT VIDEO'}</button>
-                    </section>
                  </div>
                  <section className="bg-white/5 p-8 rounded-[2rem] border border-white/5"><h3 className="text-[10px] font-black text-white/30 uppercase tracking-[0.3em] mb-6">Candidate Interrogator</h3>
                     <div className="space-y-4 mb-6 max-h-[300px] overflow-y-auto pr-2 custom-scrollbar">
