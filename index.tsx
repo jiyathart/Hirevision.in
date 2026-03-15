@@ -967,7 +967,13 @@ const App: React.FC = () => {
     
     });
     // Initial fetch
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    supabase.auth.getSession().then(({ data: { session }, error }) => {
+      if (error) {
+        console.error("Supabase getSession error:", error);
+        if (error.message.includes('Refresh Token') || error.message.includes('refresh token')) {
+          supabase.auth.signOut();
+        }
+      }
       const currentUser = session?.user ? { uid: session.user.id, email: session.user.email || null, phoneNumber: session.user.phone || null, isAnonymous: session.user.is_anonymous } : null;
       auth.currentUser = currentUser;
 

@@ -1,10 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 
-// 1. Replace this URL with your Supabase Project URL
-const SUPABASE_URL = "https://iwjaolxtvqwrfoihufxt.supabase.co";
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || "https://iwjaolxtvqwrfoihufxt.supabase.co";
+const SUPABASE_PUBLIC_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml3amFvbHh0dnF3cmZvaWh1Znh0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM0ODE4MzEsImV4cCI6MjA4OTA1NzgzMX0.B7ssuHtnz3dQrInQZt8CTQFW1wbMjr8OM6xoCVJJEFk";
 
-// 2. Replace this key with your Supabase anon/public key
-const SUPABASE_PUBLIC_KEY = "sb_publishable__QbpGfvVQJW8RopPIMCmFA_TDXk5mZv";
-
-// 3. Export the Supabase client
 export const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLIC_KEY);
